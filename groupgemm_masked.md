@@ -30,7 +30,7 @@ sequenceDiagram
     CUDA-->>Test: Return results
 ```
 
-### input/output (example: num_groups(num_local_experts?)=4, m=256, n=2048, k=7168)
+### input/output (example: num_groups(num_local_experts)=4, m(batch_size)=256, n(output_dim)=2048, k(common_dim)=7168)
 | Parameter | Type | Shape | Dtype | Description | Example |
 |-----------|------|--------|--------|-------------|------------------------------------------------|
 | lhs | tuple(torch.Tensor, torch.Tensor) | ([num_groups, m_max, k], [num_groups, m_max, ⌈k/128⌉]) | (torch.float8_e4m3fn, torch.float32) | input & scale | ([4, 256, 7168], [4, 256, 56]) |
