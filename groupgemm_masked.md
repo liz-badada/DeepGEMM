@@ -26,8 +26,4 @@ sequenceDiagram
     JIT->>CUDA: Execute kernel<br/>Parameters:<br/>- lhs, lhs_scales<br/>- rhs, rhs_scales<br/>- out<br/>- masked_m<br/>- m<br/>- stream<br/>- num_sms<br/>- smem_size
     
     CUDA-->>Test: Return results
-    
-    Test->>Test: Validate results<br/>calc_diff()<br/>Check error < 0.001
-    
-    Note over Test: Performance testing<br/>bench_kineto()<br/>Output latency and throughput
 ```
