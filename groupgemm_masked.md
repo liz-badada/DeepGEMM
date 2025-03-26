@@ -17,7 +17,7 @@ sequenceDiagram
     
     GEMM->>GEMM: Parameter validation<br/>- Type checking<br/>- Shape checking<br/>- Contiguity checking
     
-    GEMM->>GEMM: Prepare LHS scales<br/>get_col_major_tma_aligned_tensor()
+    GEMM->>GEMM: Prepare lhs scales<br/>get_col_major_tma_aligned_tensor()
     
     GEMM->>GEMM: Get optimal configuration<br/>get_best_configs()<br/>- num_sms<br/>- block_m<br/>- block_n<br/>- num_stages<br/>- tma_multicast_config<br/>- smem_size
     
