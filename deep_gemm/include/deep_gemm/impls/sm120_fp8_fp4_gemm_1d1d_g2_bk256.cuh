@@ -102,7 +102,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
-    static constexpr uint32_t kTMARegisters = 32;
+    static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = kUseG1PsumLegacyPath ? 216 : 232;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
@@ -214,7 +214,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    static constexpr uint32_t kSchedulerGroup = kUseG1PsumLegacyPath ? 11 : 7;
+    static constexpr uint32_t kSchedulerGroup = kUseG1PsumLegacyPath ? 11 : 5;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment, kSchedulerGroup>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
