@@ -102,8 +102,7 @@ public:
                 return "100";
             return support_arch_family ? "100f" : "100a";
         }
-        // SM12.1 reuses the SM120 family cubin when `sm_<NN>f` is available.
-        if (major == 12 and (minor != 1 or support_arch_family)) {
+        if (major == 12 and minor != 1) {
             if (number_only)
                 return "120";
             return support_arch_family ? "120f" : "120a";

@@ -19,6 +19,21 @@ struct SM120ArchSpec {
         const int elem_size = get_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
+        const bool use_g1_psum_layout = desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool is_g2_masked_fp4 = desc.gemm_type == GemmType::MGroupedMasked and
+            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
+        const bool use_g2_bk256_scale2_indexfix = is_g2_masked_fp4 and desc.num_sms == 48;
+
+        if (use_g1_psum_layout or use_g2_bk256_scale2_indexfix) {
+            const int block_m = use_g1_psum_layout ? 128 : 192;
+            const int block_n = use_g1_psum_layout ? 192 : 128;
+            const int block_k = use_g2_bk256_scale2_indexfix ? 256 : (128 / elem_size);
+            const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
+            const auto storage_config = get_storage_config(desc, layout);
+            DG_HOST_ASSERT(storage_config.swizzle_a_mode >= 64 and storage_config.swizzle_b_mode >= 64);
+            DG_HOST_ASSERT(get_pipeline_config(desc, layout, storage_config).num_stages >= 2);
+            return {layout};
+        }
 
         // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
         // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
@@ -154,8 +169,13 @@ struct SM120ArchSpec {
 
         int store_m = layout.block_m;
         constexpr int kSubTileM = 64;
+        const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
+            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and
+            desc.num_sms == 48 and layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
         const bool supports_subtile = (desc.kernel_type != KernelType::KernelNoSF);
-        if (supports_subtile and swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
+        if (use_g2_bk256_scale2_indexfix) {
+            store_m = 32;
+        } else if (supports_subtile and swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
             const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
             const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
             if (stages_sub > stages_full)
@@ -186,8 +206,12 @@ struct SM120ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (desc.kernel_type == KernelType::Kernel1D1D) {
-            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128);
-            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128);
+            const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
+                desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and desc.num_sms == 48 and
+                layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
+            const int num_sf_stage_rows = use_g2_bk256_scale2_indexfix ? 2 : 1;
+            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
+            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
         }
 
         const int smem_tensormap =

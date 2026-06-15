@@ -46,8 +46,21 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const bool use_g2_bk256_special_impl = args.gemm_desc.gemm_type == GemmType::MGroupedMasked and
+            args.is_fp4 and !args.b_is_fp4 and args.gemm_desc.major_b == cute::UMMA::Major::K and
+            args.gemm_config.layout.block_m == 192 and args.gemm_config.layout.block_n == 128 and
+            args.gemm_config.layout.block_k == 256 and args.gran_k_a == 32 and args.gran_k_b == 32 and
+            args.gemm_config.pipeline_config.num_stages == 2 and
+            args.gemm_config.launch_config.num_tma_threads == 128 and
+            args.gemm_config.launch_config.num_math_threads == 256 and
+            args.gemm_config.launch_config.num_sms == 48 and
+            args.gemm_config.storage_config.store_block_m == 32 and
+            args.gemm_config.split_k_factor == 1;
+        const char* impl_header = use_g2_bk256_special_impl
+            ? "sm120_fp8_fp4_gemm_1d1d_g2_bk256.cuh"
+            : "sm120_fp8_fp4_gemm_1d1d.cuh";
         return fmt::format(R"(
-#include <deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh>
+#include <deep_gemm/impls/{}>
 
 using namespace deep_gemm;
 
@@ -74,6 +87,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        impl_header,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
@@ -451,10 +465,17 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode, 0, false,
                                               b_is_fp4 ? true : fp4_unpacked);
+    const bool use_g2_bk256_scale2_indexfix = is_fp4 and !b_is_fp4 and config.layout.block_m == 192 and
+        config.layout.block_n == 128 and config.layout.block_k == 256 and
+        config.pipeline_config.num_stages == 2 and config.storage_config.store_block_m == 32;
+    const bool needs_multirow_sf = is_fp4 and !b_is_fp4 and
+        (config.layout.block_k > 4 * gran_k_a or config.layout.block_k > 4 * gran_k_b);
+    DG_HOST_ASSERT(not needs_multirow_sf or use_g2_bk256_scale2_indexfix);
+    const int sf_smem_k_rows = use_g2_bk256_scale2_indexfix ? 2 : 1;
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, gran_k_a, 1, 0);
+                                                 config.layout.block_m, gran_k_a, 1, 0, 0, false, sf_smem_k_rows);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                 config.layout.block_n, gran_k_b, num_groups, 0);
+                                                 config.layout.block_n, gran_k_b, num_groups, 0, 0, false, sf_smem_k_rows);
     const int cd_store_m = config.storage_config.store_block_m > 0
         ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
@@ -537,10 +558,17 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode, 0, false,
                                               b_is_fp4 ? true : fp4_unpacked);
+    const bool use_g2_bk256_scale2_indexfix = is_fp4 and !b_is_fp4 and config.layout.block_m == 192 and
+        config.layout.block_n == 128 and config.layout.block_k == 256 and
+        config.pipeline_config.num_stages == 2 and config.storage_config.store_block_m == 32;
+    const bool needs_multirow_sf = is_fp4 and !b_is_fp4 and
+        (config.layout.block_k > 4 * gran_k_a or config.layout.block_k > 4 * gran_k_b);
+    DG_HOST_ASSERT(not needs_multirow_sf or use_g2_bk256_scale2_indexfix);
+    const int sf_smem_k_rows = use_g2_bk256_scale2_indexfix ? 2 : 1;
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, gran_k_a, num_groups, 0);
+                                                 config.layout.block_m, gran_k_a, num_groups, 0, 0, false, sf_smem_k_rows);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                 config.layout.block_n, gran_k_b, num_groups, 0);
+                                                 config.layout.block_n, gran_k_b, num_groups, 0, 0, false, sf_smem_k_rows);
     const int cd_store_m = config.storage_config.store_block_m > 0
         ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
