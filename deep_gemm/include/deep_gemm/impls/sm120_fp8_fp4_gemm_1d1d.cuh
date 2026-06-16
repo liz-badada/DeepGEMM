@@ -86,7 +86,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
     static constexpr bool kUseG1PsumLegacyPath = (kGemmType == GemmType::MGroupedContiguousWithPsumLayout);
-    static constexpr bool kUseOptimizedGroupedFP4Path = kUseG1PsumLegacyPath or kUseG2BK256Scale2;
+    static constexpr bool kUseG1FP4OptimizedPath = kUseG1PsumLegacyPath and kIsFP4 and not kBIsFP4;
+    static constexpr bool kUseOptimizedGroupedFP4Path = kUseG1FP4OptimizedPath or kUseG2BK256Scale2;
 
     // Keep the base warp layout for generic kernels. The 48-SM G2 BK256 path
     // uses an N-heavy mapping validated on GB10.
@@ -101,7 +102,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
     static constexpr uint32_t kTMARegisters = kUseOptimizedGroupedFP4Path ? 32 : 40;
-    static constexpr uint32_t kMMARegisters = kUseG1PsumLegacyPath ? 216 : 232;
+    static constexpr uint32_t kMMARegisters = kUseG1FP4OptimizedPath ? 216 : 232;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = kSwizzleCDMode > 0
@@ -213,7 +214,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kUseOptimizedGroupedFP4Path ? kGranKA * 4 : (kGranKA > kGranKB ? kGranKA : kGranKB) * 4;
     static constexpr bool kSchedulerOnA = kUseOptimizedGroupedFP4Path ? true : false;
-    static constexpr uint32_t kSchedulerGroup = kUseG1PsumLegacyPath ? 11 :
+    static constexpr uint32_t kSchedulerGroup = kUseG1FP4OptimizedPath ? 11 :
         (kUseG2BK256Scale2 ? 7 : sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kSchedulerOnA>());
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, kSchedulerOnA, kNumSMs, kSFKAlignment,
         kSchedulerGroup, kSplitKFactor>(

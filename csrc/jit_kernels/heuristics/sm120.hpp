@@ -19,14 +19,17 @@ struct SM120ArchSpec {
         const int elem_size = get_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
-        const bool use_g1_psum_layout = desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool is_g1_contiguous = desc.gemm_type == GemmType::MGroupedContiguous or
+            desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
+        const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
         const bool is_g2_masked_fp4 = desc.gemm_type == GemmType::MGroupedMasked and
-            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
+            desc.kernel_type == KernelType::Kernel1D1D and is_fp4_fp4;
         const bool use_g2_bk256_scale2_indexfix = is_g2_masked_fp4 and desc.num_sms == 48;
 
-        if (use_g1_psum_layout or use_g2_bk256_scale2_indexfix) {
-            const int block_m = use_g1_psum_layout ? 128 : 192;
-            const int block_n = use_g1_psum_layout ? 192 : 128;
+        if (use_g1_fp4_layout or use_g2_bk256_scale2_indexfix) {
+            const int block_m = use_g1_fp4_layout ? 128 : 192;
+            const int block_n = use_g1_fp4_layout ? 192 : 128;
             const int block_k = use_g2_bk256_scale2_indexfix ? 256 : (128 / elem_size);
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
             const auto storage_config = get_storage_config(desc, layout);
