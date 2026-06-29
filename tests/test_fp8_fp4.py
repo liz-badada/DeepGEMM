@@ -17,6 +17,9 @@ from generators import (
     get_mk_alignment_for_contiguous_layout
 )
 
+G2_MASKED_PERF_CONFIG = (6, 4096, 1024, 4096, 4096)
+G2_FIXED_MASKED_M = [768, 896, 768, 768, 1152, 1024]
+
 
 def test_gemm() -> None:
     print('Testing GEMM:')
@@ -53,14 +56,8 @@ def test_gemm() -> None:
                          'gemm_', suppress_kineto_output=True)
         a_k = a[0].contiguous() if not major_a.is_k_major() else a[0]
         b_k = b[0].contiguous() if not major_b.is_k_major() else b[0]
-        # On SM120 (consumer Blackwell) cuBLAS picks either an nvjet GEMM kernel or
-        # falls back to a legacy sm89_xmma FP8 kernel depending on shape; match both,
-        # plus the split-K reduce kernel. (SM90/SM100 use nvjet and never the sm89
-        # fallback, so 'xmma' simply matches nothing there.)
-        cublas_nvjet, cublas_xmma, split_k_t = \
-            bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'xmma', 'reduce'), suppress_kineto_output=True) \
-            if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0, 0)
-        cublas_t = cublas_nvjet + cublas_xmma
+        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
+                              if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
@@ -144,6 +141,12 @@ def test_m_grouped_gemm_masked() -> None:
             a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
                                                                          use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
                                                                          quant_config=quant_config)
+            is_g2_perf_case = (
+                not use_psum_layout
+                and (num_groups, max_m, expected_m_per_group, n, k) == G2_MASKED_PERF_CONFIG
+            )
+            if is_g2_perf_case:
+                masked_m.copy_(masked_m.new_tensor(G2_FIXED_MASKED_M))
             if use_psum_layout:
                 a_psum = (layout_masked_to_psum(a[0], psum_m), layout_masked_to_psum(a[1], psum_m))
                 d_psum = layout_masked_to_psum(d, psum_m)
@@ -178,8 +181,11 @@ def test_m_grouped_gemm_masked() -> None:
             sum_ops += 2 * valid_m * n * k
             sum_bytes += count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)
 
+        mask_note = ', mask=round128' if (
+            not use_psum_layout and (num_groups, max_m, expected_m_per_group, n, k) == G2_MASKED_PERF_CONFIG
+        ) else ''
         print(f' > Perf (num_groups={num_groups:2}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, '
-              f'{kernel_opt}, psum={1 if use_psum_layout else 0}): '
+              f'{kernel_opt}, psum={1 if use_psum_layout else 0}{mask_note}): '
               f'{sum_t / num_tests * 1e6:4.0f} us (max: {max_t * 1e6:3.0f} us) | '
               f'{sum_ops / sum_t / 1e12:4.0f} TFLOPS | '
               f'{sum_bytes / sum_t / 1e9:4.0f} GB/s')
