@@ -18,16 +18,19 @@ struct SM120ArchSpec {
 
         // G1 contiguous uses BM128. FP4xFP4 G1 uses BN192; non-FP4xFP4
         // psum needs BN128 to keep at least 2 pipeline stages.
-        // G2 masked on 48-SM GB10 uses the KF-selected BM192/BN128/BK128 path.
+        // G2 masked FP4 on 48-SM SM120/SM121 uses the 80fa9ee BK256
+        // special path; keep it isolated so G1 stays on the 48b path.
         const bool is_g1_contiguous = desc.gemm_type == GemmType::MGroupedContiguous or
             desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
         const bool is_g2_masked = desc.gemm_type == GemmType::MGroupedMasked;
         const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
         const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
         const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
+        const bool use_g2_bk256_layout = use_g2_gb10_layout and is_fp4_fp4 and
+            desc.kernel_type == KernelType::Kernel1D1D;
         const int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
         const int target_block_n = use_g1_fp4_layout ? 192 : 128;
-        const int block_k = 128 / elem_size;
+        const int block_k = use_g2_bk256_layout ? 256 : (128 / elem_size);
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
         std::vector<int> block_n_candidates;
@@ -115,10 +118,15 @@ struct SM120ArchSpec {
 
         int store_m = layout.block_m;
         int best_stages = stages_full;
-        const bool use_g2_gb10_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
+        const bool use_g2_bk256_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
             desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and
-            layout.block_m == 192 and layout.block_n == 128;
-        if (use_g2_gb10_layout and swizzle_mode_cd > 0) {
+            layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
+        if (use_g2_bk256_layout) {
+            store_m = 32;
+        } else if (desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
+                   desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and
+                   desc.b_dtype == kPackedFP4 and layout.block_m == 192 and layout.block_n == 128 and
+                   swizzle_mode_cd > 0) {
             for (const int candidate : {96, 64, 48, 32, 24, 16}) {
                 if (layout.block_m <= candidate or layout.block_m % candidate != 0)
                     continue;
@@ -163,8 +171,12 @@ struct SM120ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (desc.kernel_type == KernelType::Kernel1D1D) {
-            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128);
-            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128);
+            const bool use_g2_bk256_layout = desc.gemm_type == GemmType::MGroupedMasked and
+                desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and desc.num_sms == 48 and
+                layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
+            const int num_sf_stage_rows = use_g2_bk256_layout ? 2 : 1;
+            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
+            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
         }
 
         const int smem_tensormap =

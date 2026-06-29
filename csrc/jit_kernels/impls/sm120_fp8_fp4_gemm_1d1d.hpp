@@ -44,8 +44,20 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const bool use_g2_bk256_special_impl = args.gemm_desc.gemm_type == GemmType::MGroupedMasked and
+            args.is_fp4 and !args.b_is_fp4 and args.gemm_desc.major_b == cute::UMMA::Major::K and
+            args.gemm_config.layout.block_m == 192 and args.gemm_config.layout.block_n == 128 and
+            args.gemm_config.layout.block_k == 256 and args.gran_k_a == 32 and args.gran_k_b == 32 and
+            args.gemm_config.pipeline_config.num_stages == 2 and
+            args.gemm_config.launch_config.num_tma_threads == 128 and
+            args.gemm_config.launch_config.num_math_threads == 256 and
+            args.gemm_config.launch_config.num_sms == 48 and
+            args.gemm_config.storage_config.store_block_m == 32;
+        const char* impl_header = use_g2_bk256_special_impl
+            ? "sm120_fp8_fp4_gemm_1d1d_g2_bk256.cuh"
+            : "sm120_fp8_fp4_gemm_1d1d.cuh";
         return fmt::format(R"(
-#include <deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh>
+#include <deep_gemm/impls/{}>
 
 using namespace deep_gemm;
 
@@ -71,6 +83,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        impl_header,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
