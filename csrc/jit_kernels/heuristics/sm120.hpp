@@ -252,6 +252,40 @@ struct SM120ArchSpec {
             return a.layout.block_n > b.layout.block_n;
         return false;
     }
+
+    static int get_split_k_factor(const GemmDesc& desc, const Layout& layout) {
+        if (desc.gemm_type != GemmType::Normal or desc.kernel_type == KernelType::KernelNoSF)
+            return 1;
+
+        const int num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
+        const int num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
+        const int num_mn_blocks = num_m_blocks * num_n_blocks;
+        const int num_k_blocks = ceil_div(static_cast<int>(desc.get_expected_k()), layout.block_k);
+
+        if (num_mn_blocks >= desc.num_sms / 2)
+            return 1;
+
+        const int target_blocks = desc.num_sms * 3 / 4;
+        int split_k = ceil_div(target_blocks, num_mn_blocks);
+
+        // k_per_split must be divisible by the kernel's SF tile size so each
+        // partition starts at an SF-aligned K-block boundary. The kernel packs
+        // 4 UE8M0 bytes per int32, spanning (4 * max_gran_k / block_k) k-blocks.
+        const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
+        if (kSFTileKBlocks == 0)
+            return 1;
+        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
+            --split_k;
+
+        split_k = std::min(split_k, num_k_blocks / (2 * kSFTileKBlocks));
+
+        constexpr int64_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
+        const int64_t mn_bytes = static_cast<int64_t>(desc.get_expected_m()) * desc.get_expected_n() * sizeof(float);
+        if (mn_bytes > 0)
+            split_k = std::min(split_k, std::max(static_cast<int>(kMaxWorkspaceBytes / mn_bytes), 1));
+
+        return std::max(split_k, 1);
+    }
 };
 
 } // namespace deep_gemm
