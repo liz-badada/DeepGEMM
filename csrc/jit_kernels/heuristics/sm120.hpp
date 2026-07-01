@@ -7,14 +7,67 @@
 #include "runtime.hpp"
 #include "utils.hpp"
 #include "../../utils/exception.hpp"
+#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
+    static constexpr const char* dsv4_dense_layout_overrides_env = "DG_ENABLE_DSV4_DENSE_LAYOUT_OVERRIDES";
+
+    static bool enable_dsv4_dense_layout_overrides() {
+        static const bool enabled = get_env<int>(dsv4_dense_layout_overrides_env, 0) != 0;
+        return enabled;
+    }
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
+
+        if (enable_dsv4_dense_layout_overrides()) {
+            // DSv4 dense decode: the public small-M Normal GEMM path swaps A/B,
+            // so runtime desc is (m=N_orig, n=M_orig, k=K). Keep this rule
+            // narrow to avoid changing Grouped GEMM, BMM/einsum, mixed
+            // FP8xFP4, or prefill. It is gated because this SM120ArchSpec can
+            // also be used by non-DSv4 SM120 builds that have not been
+            // validated with these tuned tiles.
+            if (desc.gemm_type == GemmType::Normal and desc.kernel_type == KernelType::Kernel1D1D
+                and desc.n > 0 and desc.n <= 4
+                and desc.a_dtype == at::kFloat8_e4m3fn and desc.b_dtype == at::kFloat8_e4m3fn
+                and desc.cd_dtype == at::kBFloat16 and not desc.with_accumulation) {
+                int block_m = 0;
+                int block_k = 0;
+                if (desc.k == 1024) {
+                    if (desc.m >= 16384) {
+                        block_m = 192;
+                        block_k = 128;
+                    } else if (desc.m >= 4096) {
+                        block_m = 128;
+                        block_k = 64;
+                    }
+                } else if (desc.k == 4096) {
+                    block_m = desc.m <= 2048 ? 64 : 128;
+                    block_k = 128;
+                }
+                if (block_m > 0)
+                    return {Layout{0, block_m, 16, block_k, 1, 1}};
+            }
+
+            // DSv4 dense prefill: public Normal GEMM runtime shape is
+            // (m=tokens, n=projection width, k=hidden). Keep this separate from
+            // the small-N swap path above; the sweep target is long-context
+            // prefill chunks with M around max_num_batched_tokens.
+            if (desc.gemm_type == GemmType::Normal and desc.kernel_type == KernelType::Kernel1D1D
+                and desc.m >= 2048 and desc.n > 32
+                and desc.a_dtype == at::kFloat8_e4m3fn and desc.b_dtype == at::kFloat8_e4m3fn
+                and desc.cd_dtype == at::kBFloat16 and not desc.with_accumulation) {
+                if (desc.k == 1024 and desc.n >= 8192)
+                    return {Layout{0, 192, 128, 64, 1, 1}};
+                if (desc.k == 4096 and desc.n == 4096)
+                    return {Layout{0, 192, 128, 128, 1, 1}};
+                if (desc.k == 4096 and desc.n == 2048)
+                    return {Layout{0, 128, 128, 128, 1, 1}};
+            }
+        }
 
         // G1 contiguous uses BM128. FP4xFP4 G1 uses BN192; non-FP4xFP4
         // psum needs BN128 to keep at least 2 pipeline stages.
