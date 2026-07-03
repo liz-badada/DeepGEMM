@@ -79,8 +79,7 @@ struct SM120ArchSpec {
         const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
         const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
         const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
-        const bool use_g2_bk256_layout = use_g2_gb10_layout and is_fp4_fp4 and
-            desc.kernel_type == KernelType::Kernel1D1D;
+        const bool use_g2_bk256_layout = false;  // removed BK256 special path (bk256.cuh deleted)
         const int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
         const int target_block_n = use_g1_fp4_layout ? 192 : 128;
         const int block_k = use_g2_bk256_layout ? 256 : (128 / elem_size);
@@ -263,47 +262,81 @@ struct SM120ArchSpec {
     }
 
     static LayoutInfo get_layout_info(const GemmDesc& desc, const Layout& layout) {
-        const auto num_blocks =
-            ceil_div(desc.get_expected_m(), layout.block_m) *
-            ceil_div(desc.get_expected_n(), layout.block_n) *
-            desc.get_expected_num_groups();
+        const auto num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
+        const auto num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
+        const auto num_blocks = num_m_blocks * num_n_blocks * desc.get_expected_num_groups();
         const auto num_waves = ceil_div(num_blocks, desc.num_sms);
         const auto num_last_blocks = num_blocks % desc.num_sms;
         const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
 
+        // TMA-bound latency model (empirically validated on SM120a):
+        //   block_time = k_blocks * (tma_bytes_per_kblock * kCyPerTmaByte + kSyncPerKBlock) + kBlockOverheadCy
+        //   total_latency = num_waves * block_time
+        // The kernel is TMA-bound for most tile configs. The discrete num_waves
+        // (ceil division) dominates the BM=64 vs BM=128 decision.
+        // kSyncPerKBlock captures per-kblock barrier overhead (mbarrier ~137 cy).
+        // More pipeline stages reduce effective stall: kSyncPerKBlock / sqrt(stages).
+        static constexpr double kCyPerTmaByte = 0.07;     // ~35 GB/s per SM
+        static constexpr double kSyncBaseCy = 120.0;      // per-kblock barrier overhead
+        static constexpr double kBlockOverheadCy = 2000;   // epilogue + scheduling
+
         const int64_t expected_k = desc.get_expected_k();
-        int64_t flops_per_block = 2LL * layout.block_m * layout.block_n * expected_k;
+        const int k_blocks = ceil_div(static_cast<int>(expected_k), layout.block_k);
 
-        // Empirical warp-spec MMA efficiency model.
-        // A reuse = BN/8 (each A fragment reused across N-tiles).
-        // Cooperative layout: larger BN reduces epilogue overhead (fewer tiles) and
-        // increases compute per K-block (better TMA latency amortization).
-        const double a_reuse = static_cast<double>(layout.block_n) / 8.0;
-        const bool use_g2_gb10_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48;
-        double mma_efficiency = use_g2_gb10_layout
-            ? 0.69 + 0.07 * std::min(1.0, (a_reuse - 8.0) / 8.0)
-            : 0.69 + 0.12 * std::min(1.0, (a_reuse - 4.0) / 12.0);
+        const int elem_size = get_element_size(desc.get_mma_kind());
+        const int sf_bytes_a = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_m * 4, 128) : 0;
+        const int sf_bytes_b = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_n * 4, 128) : 0;
+        const int64_t tma_bytes_per_kb = (int64_t)layout.block_m * layout.block_k * elem_size
+                                       + (int64_t)layout.block_n * layout.block_k * elem_size
+                                       + sf_bytes_a + sf_bytes_b;
 
-        const double peak_flops_per_ns = (desc.a_dtype == at::kBFloat16) ? 380000.0 : 762000.0;
-        double block_ns = flops_per_block / (peak_flops_per_ns * mma_efficiency);
+        const auto storage_config = get_storage_config(desc, layout);
+        const int num_stages = get_pipeline_config(desc, layout, storage_config).num_stages;
+        const double sync_per_kb = kSyncBaseCy / std::sqrt(static_cast<double>(num_stages));
 
-        float wave_efficiency = static_cast<float>(num_blocks) / (num_waves * desc.num_sms);
-        int64_t num_cycles = static_cast<int64_t>(block_ns * num_blocks / wave_efficiency);
+        const double tma_per_kb = tma_bytes_per_kb * kCyPerTmaByte + sync_per_kb;
 
-        return {num_waves, last_wave_util, num_cycles, layout};
+        // Account for split-K when evaluating tile candidates: if the tile produces
+        // too few blocks, split-K will divide K across more blocks. Model this by
+        // computing the effective k_blocks per partition and total waves.
+        const int split_k = (desc.gemm_type == GemmType::Normal) ? get_split_k_factor(desc, layout) : 1;
+        const int k_blocks_eff = (split_k > 1) ? k_blocks / split_k : k_blocks;
+        const int total_blocks = num_blocks * split_k;
+        const auto num_waves_eff = ceil_div(total_blocks, desc.num_sms);
+
+        const double block_time = k_blocks_eff * tma_per_kb + kBlockOverheadCy;
+        // Split-K adds reduction overhead: reduce kernel launch + workspace write/read.
+        // Empirically ~2-3 us on SM120a, modeled as fixed + per-element cost.
+        const double reduce_fixed_cy = 5000.0;
+        const double reduce_per_elem_cy = 0.01;
+        const double reduce_overhead = (split_k > 1)
+            ? reduce_fixed_cy + reduce_per_elem_cy * desc.get_expected_m() * desc.get_expected_n()
+            : 0.0;
+        const int64_t total_latency = static_cast<int64_t>(num_waves_eff * block_time + reduce_overhead);
+
+        return {num_waves_eff, last_wave_util, total_latency, layout};
     }
 
     static bool compare(const LayoutInfo& a, const LayoutInfo& b) {
-        if (a.num_waves != b.num_waves and (a.num_waves == 1 or b.num_waves == 1))
-            return a.num_waves < b.num_waves;
+        // Use 5% tolerance: within this band, prefer tile-shape tie-breaks
+        const double ratio = (b.num_cycles > 0)
+            ? static_cast<double>(a.num_cycles) / b.num_cycles : 1.0;
+        if (ratio < 0.95) return true;   // a clearly better
+        if (ratio > 1.05) return false;  // b clearly better
 
-        if (a.num_cycles != b.num_cycles)
-            return a.num_cycles < b.num_cycles;
-
-        // Tie-break: prefer larger tile for better reuse
+        // Within 5%: prefer larger N tile for better reuse
         if (a.layout.block_n != b.layout.block_n)
             return a.layout.block_n > b.layout.block_n;
-        return false;
+        // Prefer smaller K tile (more pipeline stages for TMA hiding)
+        if (a.layout.block_k != b.layout.block_k)
+            return a.layout.block_k < b.layout.block_k;
+        // Prefer larger M tile for better per-block efficiency
+        if (a.layout.block_m != b.layout.block_m)
+            return a.layout.block_m > b.layout.block_m;
+        // Final: lower absolute latency
+        return a.num_cycles < b.num_cycles;
     }
 
     static int get_split_k_factor(const GemmDesc& desc, const Layout& layout) {
