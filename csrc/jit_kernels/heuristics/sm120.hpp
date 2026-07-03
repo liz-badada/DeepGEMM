@@ -105,7 +105,12 @@ struct SM120ArchSpec {
             : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
-        const auto swizzle_mode_cd = (c10::elementSize(desc.cd_dtype) <= 2) ? 128 : 0;
+        // Swizzled TMA-store epilogue requires a plain (stride_cd_n == 0) output.
+        // AB-swapped dense GEMMs surface as n < block_n with a transposed
+        // (strided) D that the CD tensor map cannot describe — keep them on the
+        // direct-store epilogue by disabling the CD swizzle.
+        const auto swizzle_mode_cd =
+            (c10::elementSize(desc.cd_dtype) <= 2 and desc.n >= layout.block_n) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
