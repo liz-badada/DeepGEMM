@@ -43,8 +43,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
-          uint32_t kSplitKFactor = 1,
-          bool kStridedCDN = false>
+          uint32_t kSplitKFactor = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -894,6 +893,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 };
 
+                const bool can_pair = (stride_cd_n == 0);
+                const int64_t cd_n_stride = can_pair ? 1 : static_cast<int64_t>(stride_cd_n);
+
                 #pragma unroll
                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                     #pragma unroll
@@ -904,7 +906,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if constexpr (not kStridedCDN) {
+                        if (can_pair) {
                             if (row0 < total_shape_m and col + 1 < shape_n) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
@@ -918,37 +920,20 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 store_pair(&gmem_d[idx], v2, v3);
                             }
                         } else {
-                            // Strided store: per-element N bounds check (handles shape_n=1).
-                            const int64_t cd_n_stride = static_cast<int64_t>(stride_cd_n);
+                            // Strided store: per-element N bounds check (handles shape_n=1)
                             if (row0 < total_shape_m) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
-                                if (col < shape_n) {
-                                    auto idx = base + static_cast<int64_t>(col) * cd_n_stride;
-                                    float v0 = accum[ai + 0];
-                                    if constexpr (kWithAccumulation) v0 += read_cd(gmem_c[idx]);
-                                    gmem_d[idx] = cd_dtype_t(v0);
-                                }
-                                if (col + 1 < shape_n) {
-                                    auto idx = base + static_cast<int64_t>(col + 1) * cd_n_stride;
-                                    float v1 = accum[ai + 1];
-                                    if constexpr (kWithAccumulation) v1 += read_cd(gmem_c[idx]);
-                                    gmem_d[idx] = cd_dtype_t(v1);
-                                }
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 0]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 1]);
                             }
                             if (row1 < total_shape_m) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
-                                if (col < shape_n) {
-                                    auto idx = base + static_cast<int64_t>(col) * cd_n_stride;
-                                    float v2 = accum[ai + 2];
-                                    if constexpr (kWithAccumulation) v2 += read_cd(gmem_c[idx]);
-                                    gmem_d[idx] = cd_dtype_t(v2);
-                                }
-                                if (col + 1 < shape_n) {
-                                    auto idx = base + static_cast<int64_t>(col + 1) * cd_n_stride;
-                                    float v3 = accum[ai + 3];
-                                    if constexpr (kWithAccumulation) v3 += read_cd(gmem_c[idx]);
-                                    gmem_d[idx] = cd_dtype_t(v3);
-                                }
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 2]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 3]);
                             }
                         }
                     }
