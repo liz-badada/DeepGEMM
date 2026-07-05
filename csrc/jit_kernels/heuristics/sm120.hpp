@@ -80,7 +80,16 @@ struct SM120ArchSpec {
         const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
         const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
         const bool use_g2_bk256_layout = false;  // removed BK256 special path (bk256.cuh deleted)
-        const int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
+        int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
+        // CRITICAL: for grouped contiguous GEMM, BLOCK_M must divide the runtime
+        // MK alignment — group boundaries are only padded to that alignment, and
+        // larger tiles straddle expert boundaries causing wrong results.
+        if (is_g1_contiguous) {
+            const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+            if (runtime_align % block_m != 0)
+                block_m = 64;
+            DG_HOST_ASSERT(runtime_align % block_m == 0);
+        }
         const int target_block_n = use_g1_fp4_layout ? 192 : 128;
         const int block_k = use_g2_bk256_layout ? 256 : (128 / elem_size);
 

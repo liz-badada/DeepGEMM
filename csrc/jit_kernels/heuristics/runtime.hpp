@@ -50,12 +50,10 @@ public:
         if (arch_major != 10 and arch_major != 12)
             return kLegacyMKAlignmentForContiguousLayout;
 
-        // SM120 m-grouped psum layout still uses BLOCK_M=128 group-boundary
-        // alignment in the scheduler, so expose 128 as the minimum layout
-        // alignment here as well.
+        // SM120: kMWarps=4, MMA_M=16, valid BLOCK_M must be multiple of 64
         int block_m = arch_major == 12 ? 128 : 240;
-        int min_block_m = arch_major == 12 ? 128 : 32;
-        int mma_step = 16;
+        int min_block_m = arch_major == 12 ? 64 : 32;
+        int mma_step = arch_major == 12 ? 64 : 16;
         if (expected_m.has_value()) {
             int per_expert_m = expected_m.value();
             if (num_groups.has_value() and num_groups.value() > 0)
