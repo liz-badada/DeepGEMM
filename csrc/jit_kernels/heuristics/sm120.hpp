@@ -15,6 +15,8 @@ struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
     static constexpr const char* dsv4_dense_layout_overrides_env = "DG_ENABLE_DSV4_DENSE_LAYOUT_OVERRIDES";
 
+    static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
+
     static bool enable_dsv4_dense_layout_overrides() {
         static const bool enabled = get_env<int>(dsv4_dense_layout_overrides_env, 0) != 0;
         return enabled;
@@ -69,53 +71,82 @@ struct SM120ArchSpec {
             }
         }
 
-        // G1 contiguous uses BM128. FP4xFP4 G1 uses BN192; non-FP4xFP4
-        // psum needs BN128 to keep at least 2 pipeline stages.
-        // G2 masked FP4 on 48-SM SM120/SM121 uses the 80fa9ee BK256
-        // special path; keep it isolated so G1 stays on the 48b path.
-        const bool is_g1_contiguous = desc.gemm_type == GemmType::MGroupedContiguous or
-            desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
-        const bool is_g2_masked = desc.gemm_type == GemmType::MGroupedMasked;
-        const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
-        const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
-        const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
-        const bool use_g2_bk256_layout = false;  // removed BK256 special path (bk256.cuh deleted)
-        int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
-        // CRITICAL: for grouped contiguous GEMM, BLOCK_M must divide the runtime
-        // MK alignment — group boundaries are only padded to that alignment, and
-        // larger tiles straddle expert boundaries causing wrong results.
-        if (is_g1_contiguous) {
-            const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
-            if (runtime_align % block_m != 0)
-                block_m = 64;
-            DG_HOST_ASSERT(runtime_align % block_m == 0);
-        }
-        const int target_block_n = use_g1_fp4_layout ? 192 : 128;
-        const int block_k = use_g2_bk256_layout ? 256 : (128 / elem_size);
+        const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+        const int expected_m = desc.get_expected_m();
 
-        // Block N candidates: must be multiples of 8 (mma.sync N=8)
+        // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
+        // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
+        // otherwise tiles straddle expert boundaries causing wrong results.
+        const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
+        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+
+        std::vector<int> block_m_candidates;
+        if (runtime_align <= kMinBlockM)
+            block_m_candidates.push_back(64);
+        else {
+            if (is_small_n)
+                block_m_candidates.push_back(64);
+            block_m_candidates.push_back(128);
+            if (expected_m > 0 and expected_m <= kMinBlockM)
+                block_m_candidates.push_back(64);
+            // For Normal GEMM with very few MN blocks: BM=64 creates more blocks
+            // for split-K to fill SMs.
+            const int eff_m = expected_m > 0 ? expected_m : desc.m;
+            const int approx_mn_blocks_128 = ceil_div(eff_m, 128) * ceil_div(n_for_tile, 64);
+            if (desc.gemm_type == GemmType::Normal
+                and eff_m <= 128 and approx_mn_blocks_128 < desc.num_sms / 8)
+                block_m_candidates.push_back(64);
+        }
+        if (block_m_candidates.empty())
+            block_m_candidates.push_back(128);
+        // Masked grouped GEMM: BM192 halves wave count for DSv4 expert shapes.
+        if (desc.gemm_type == GemmType::MGroupedMasked)
+            block_m_candidates.push_back(192);
+
+        // Block K candidates: BK=64 enables 4 pipeline stages (better TMA hiding),
+        // but only beneficial for large M (>= 2048) and non-mixed dtypes.
+        const bool is_mixed = (desc.a_dtype != desc.b_dtype);
+        std::vector<int> block_k_candidates;
+        if (!is_mixed and expected_m >= 2048)
+            block_k_candidates.push_back(64 / elem_size);
+        block_k_candidates.push_back(128 / elem_size);
+
+        // Block N candidates
         std::vector<int> block_n_candidates;
-        int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
-        for (int i = step; i <= 256; i += step) {
-            if ((i * get_element_size(desc.get_mma_kind())) % 64 != 0)
-                continue;
-            block_n_candidates.push_back(i);
+        if (is_small_n) {
+            // BN=16 always valid: K-major B has N as TMA outer dim, no minimum.
+            // Kernel epilogue bounds-checks shape_n for partial N tiles.
+            block_n_candidates.push_back(16);
+            if (n_for_tile > 16)
+                block_n_candidates.push_back(32);
+        } else {
+            int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
+            for (int i = step; i <= 256; i += step) {
+                if ((i * get_element_size(desc.get_mma_kind())) % 64 != 0)
+                    continue;
+                block_n_candidates.push_back(i);
+            }
         }
 
-        // MN-major B: ldmatrix.trans.x2 handles multi-atom SMEM correctly
-        const int mn_major_b_max_n = use_g2_gb10_layout ? 128 : 192;
+        // Large contiguous grouped GEMM with K-major B benefits from BN192 (fewer waves).
+        const int max_block_n = (is_m_grouped_contiguous(desc.gemm_type)
+            and desc.major_b == cute::UMMA::Major::K and expected_m >= 2048) ? 192 : 128;
 
         std::vector<Layout> candidates;
+        for (int block_m : block_m_candidates) {
+        // For grouped contiguous GEMM, BLOCK_M must divide runtime_align
+        // to prevent tiles from straddling expert boundaries.
+        if (is_m_grouped_contiguous(desc.gemm_type) and block_m > runtime_align)
+            continue;
+        for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
-            if (block_n != target_block_n)
-                continue;
-            if (block_n > mn_major_b_max_n)
+            if (!is_small_n and block_n > max_block_n)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
             const auto storage_config = get_storage_config(desc, layout);
 
-            if (storage_config.swizzle_a_mode < 64 or storage_config.swizzle_b_mode < 64)
+            if (!is_small_n and (storage_config.swizzle_a_mode < 64 or storage_config.swizzle_b_mode < 64))
                 continue;
 
             int num_stages = get_pipeline_config(desc, layout, storage_config).num_stages;
@@ -123,6 +154,8 @@ struct SM120ArchSpec {
                 continue;
 
             candidates.push_back(layout);
+        }
+        }
         }
 
         DG_HOST_ASSERT(not candidates.empty());
@@ -135,7 +168,7 @@ struct SM120ArchSpec {
 
     static int get_smem_d_size_for_swizzle(const GemmDesc& desc, const Layout& layout, int swizzle_cd, int store_m) {
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        if (swizzle_cd > 0 and cd_size <= 2
+        if (swizzle_cd > 0
             and layout.block_n * cd_size >= swizzle_cd
             and (layout.block_n * cd_size) % swizzle_cd == 0)
             return (layout.block_n * cd_size / swizzle_cd) * swizzle_cd * store_m;
@@ -167,12 +200,8 @@ struct SM120ArchSpec {
             : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
-        // Swizzled TMA-store epilogue requires a plain (stride_cd_n == 0) output.
-        // AB-swapped dense GEMMs surface as n < block_n with a transposed
-        // (strided) D that the CD tensor map cannot describe — keep them on the
-        // direct-store epilogue by disabling the CD swizzle.
-        const auto swizzle_mode_cd =
-            (c10::elementSize(desc.cd_dtype) <= 2 and desc.n >= layout.block_n) ? 128 : 0;
+        const int cd_size = c10::elementSize(desc.cd_dtype);
+        const auto swizzle_mode_cd = (layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
@@ -183,33 +212,17 @@ struct SM120ArchSpec {
         const int stages_full = std::min((smem_capacity - smem_barriers - smem_d_full) / per_stage, kNumMaxStages);
 
         int store_m = layout.block_m;
-        int best_stages = stages_full;
-        const bool use_g2_bk256_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
-            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and
-            layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
-        if (use_g2_bk256_layout) {
-            store_m = 32;
-        } else if (desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
-                   desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and
-                   desc.b_dtype == kPackedFP4 and layout.block_m == 192 and layout.block_n == 128 and
-                   swizzle_mode_cd > 0) {
-            for (const int candidate : {96, 64, 48, 32, 24, 16}) {
-                if (layout.block_m <= candidate or layout.block_m % candidate != 0)
+        constexpr int kSubTileM = 64;
+        const bool supports_subtile = (desc.kernel_type != KernelType::KernelNoSF);
+        if (supports_subtile and swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
+            int best_stages = stages_full;
+            for (const int sub : {kSubTileM, 48}) {
+                if (layout.block_m % sub != 0)
                     continue;
-                const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, candidate);
+                const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, sub);
                 const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
-                if (stages_sub > best_stages or (stages_sub == best_stages and candidate > store_m)) {
-                    best_stages = stages_sub;
-                    store_m = candidate;
-                }
-            }
-        } else {
-            constexpr int kSubTileM = 64;
-            if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM and layout.block_m % kSubTileM == 0) {
-                const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
-                const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
-                if (stages_sub > stages_full)
-                    store_m = kSubTileM;
+                if (stages_sub > best_stages)
+                    best_stages = stages_sub, store_m = sub;
             }
         }
 
@@ -237,12 +250,8 @@ struct SM120ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (desc.kernel_type == KernelType::Kernel1D1D) {
-            const bool use_g2_bk256_layout = desc.gemm_type == GemmType::MGroupedMasked and
-                desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and desc.num_sms == 48 and
-                layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
-            const int num_sf_stage_rows = use_g2_bk256_layout ? 2 : 1;
-            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
-            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
+            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128);
+            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128);
         }
 
         const int smem_tensormap =
@@ -369,7 +378,7 @@ struct SM120ArchSpec {
         int split_k = ceil_div(target_blocks, num_mn_blocks);
 
         // k_per_split must be divisible by the kernel's SF tile size so each
-        // partition starts at an SF-aligned K-block boundary. The kernel packs
+        // partition starts at an SF-aligned K-block boundary.  The kernel packs
         // 4 UE8M0 bytes per int32, spanning (4 * max_gran_k / block_k) k-blocks.
         const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
         if (kSFTileKBlocks == 0)
