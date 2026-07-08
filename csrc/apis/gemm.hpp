@@ -834,21 +834,55 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "mn");
 #endif
 
-    // SM120 explicit tile config benchmark (same interface as fp8_fp4_gemm_nt + tile override)
+    // SM120 explicit tile config benchmark (same interface as fp8_fp4_gemm_nt + tile override).
+    // `swap_ab=true` mirrors the public plain dense small-M AB-swap path without changing
+    // normal fp8_fp4_gemm_nt dispatch. This is benchmark-only plumbing for tile sweeps.
     m.def("sm120_fp8_gemm_bench", [](const std::pair<torch::Tensor, torch::Tensor>& a,
                                       const std::pair<torch::Tensor, torch::Tensor>& b,
                                       const torch::Tensor& d,
                                       std::optional<std::tuple<int, int, int>> recipe,
                                       std::optional<std::tuple<int, int>> recipe_a,
                                       std::optional<std::tuple<int, int>> recipe_b,
-                                      const int& block_m, const int& block_n, const int& block_k) {
+                                      const int& block_m, const int& block_n, const int& block_k,
+                                      const bool& swap_ab) {
         const auto major_a = get_major_type_ab(a.first);
         const auto major_b = get_major_type_ab(b.first);
         const auto [m, k] = check_ab_fp8_fp4(a.first, major_a, device_runtime->get_arch_major());
         const auto [n, k_] = check_ab_fp8_fp4(b.first, major_b, device_runtime->get_arch_major());
+        DG_HOST_ASSERT(k == k_);
+        const auto override_layout = Layout{0, block_m, block_n, block_k, 1, 1};
+
+        if (swap_ab) {
+            const bool is_mixed_fp4 = (a.first.scalar_type() != b.first.scalar_type()) and
+                                      (a.first.scalar_type() == kPackedFP4 or b.first.scalar_type() == kPackedFP4);
+            DG_HOST_ASSERT(m >= 1 and m <= 16);
+            DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(d.stride(-1) == 1 and !is_mixed_fp4);
+
+            int ga, gb, gk;
+            if (recipe.has_value()) {
+                std::tie(ga, gb, gk) = recipe.value();
+            } else if (recipe_a.has_value()) {
+                ga = std::get<0>(recipe_a.value());
+                gb = std::get<0>(recipe_b.value());
+                gk = std::get<1>(recipe_a.value());
+            } else {
+                std::tie(ga, gb, gk) = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+            }
+
+            const auto [sfa_sw, sfb_sw, gran_k_a_sw, gran_k_b_sw]
+                = layout::transform_sf_pair_into_required_layout(
+                    b.second, a.second, n, m, k, std::nullopt,
+                    std::make_tuple(gb, gk), std::make_tuple(ga, gk),
+                    std::nullopt, std::nullopt, false);
+            sm120_fp8_fp4_gemm_1d1d(b.first, sfa_sw, a.first, sfb_sw, std::nullopt, d,
+                                    n, m, k, gran_k_a_sw, gran_k_b_sw, major_b, major_a,
+                                    "nk", std::nullopt, override_layout, true);
+            return;
+        }
+
         const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
             a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, false);
-        const auto override_layout = Layout{0, block_m, block_n, block_k, 1, 1};
         sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d,
                                 m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                 "nk", std::nullopt, override_layout);
@@ -857,7 +891,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt,
           py::arg("recipe_b") = std::nullopt,
-          py::arg("block_m") = 128, py::arg("block_n") = 128, py::arg("block_k") = 128);
+          py::arg("block_m") = 128, py::arg("block_n") = 128, py::arg("block_k") = 128,
+          py::arg("swap_ab") = false);
 
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,
