@@ -89,7 +89,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         kIsFP4 and not kBIsFP4 and kBKMajor and kNumSMs == 48;
 
     // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // Mixed FP8xFP4 grouped GEMM (W4A8 serving path) runs at FP8 MMA rate and
+    // prefers the four-N-warp split with raster scheduling (validated on GB10).
+    static constexpr bool kUseMixedGroupedTuned = kIsGroupedM and kBIsFP4 and kNumSMs == 48;
+    static constexpr uint32_t kNWarps = kUseMixedGroupedTuned ? 4 : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -99,8 +102,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
-    static constexpr uint32_t kTMARegisters = kUseG2Tuned ? 24 : 40;
-    static constexpr uint32_t kMMARegisters = kUseG2Tuned ? 240 :
+    static constexpr uint32_t kTMARegisters = (kUseG2Tuned or kUseMixedGroupedTuned) ? 24 : 40;
+    static constexpr uint32_t kMMARegisters = (kUseG2Tuned or kUseMixedGroupedTuned) ? 240 :
         (kGemmType == GemmType::MGroupedContiguousWithPsumLayout ? 216 : 232);
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
@@ -211,9 +214,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = (kGranKA > kGranKB ? kGranKA : kGranKB) * 4;
     // Grouped paths use swept scheduler settings (G1: group 11; G2: group 5 + raster).
-    static constexpr uint32_t kSchedulerGroup = kIsGroupedM ? (kUseG2Tuned ? 5u : 11u)
+    static constexpr uint32_t kSchedulerGroup = kIsGroupedM
+        ? (kUseG2Tuned ? 5u : (kUseMixedGroupedTuned
+            ? (kGemmType == GemmType::MGroupedMasked ? 7u : 16u) : 11u))
         : sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>();
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, kUseG2Tuned, kNumSMs, kSFKAlignment,
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, kUseG2Tuned or kUseMixedGroupedTuned, kNumSMs, kSFKAlignment,
         kSchedulerGroup, kSplitKFactor>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
@@ -316,6 +321,19 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
+                    if constexpr (kUseMixedGroupedTuned) {
+                        // W4A8: issue the big A/B copies first, SFs last.
+                        if constexpr (kBKMajor) {
+                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        } else {
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                tma_b_desc, full_barriers[s], smem_b[s],
+                                n_idx, k_idx, 1, batch_idx);
+                        }
+                        tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                        tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                    } else {
                     if constexpr (kUseG2Tuned) {
                         tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
                         tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
@@ -331,6 +349,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             tma_b_desc, full_barriers[s], smem_b[s],
                             n_idx, k_idx, 1, batch_idx);
                     }
+                    }
                     full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                 }
             }
@@ -345,8 +364,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = math_warp_idx / kNWarps;
-        const uint32_t warp_n = math_warp_idx % kNWarps;
+        const uint32_t warp_m = kUseMixedGroupedTuned ? (math_warp_idx % kMWarps) : (math_warp_idx / kNWarps);
+        const uint32_t warp_n = kUseMixedGroupedTuned ? (math_warp_idx / kMWarps) : (math_warp_idx % kNWarps);
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 

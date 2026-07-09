@@ -99,12 +99,16 @@ struct SM120ArchSpec {
         }
         if (block_m_candidates.empty())
             block_m_candidates.push_back(128);
-        // Masked grouped GEMM: BM192 halves wave count for DSv4 expert shapes.
-        if (desc.gemm_type == GemmType::MGroupedMasked)
+        // Masked grouped GEMM: BM192 halves wave count for DSv4 expert shapes
+        // (pure-FP4 only; for mixed FP8xFP4 the padded-B SMEM keeps BM192 at two
+        // pipeline stages and BM128 measures faster on GB10).
+        if (desc.gemm_type == GemmType::MGroupedMasked and desc.a_dtype == desc.b_dtype)
             block_m_candidates.push_back(192);
 
         // Block K candidates: BK=64 enables 4 pipeline stages (better TMA hiding),
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
+        // (Mixed FP8xFP4 cannot use BK64: the 16U4_ALIGN16B B tensor map requires
+        // an inner box of at least 128 U4 elements.)
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
         std::vector<int> block_k_candidates;
         if (!is_mixed and expected_m >= 2048)
