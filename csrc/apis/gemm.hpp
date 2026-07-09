@@ -870,9 +870,10 @@ static void register_apis(pybind11::module_& m) {
                 std::tie(ga, gb, gk) = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
             }
 
+            std::optional<std::tuple<int, int, int>> swap_recipe = std::nullopt;
             const auto [sfa_sw, sfb_sw, gran_k_a_sw, gran_k_b_sw]
                 = layout::transform_sf_pair_into_required_layout(
-                    b.second, a.second, n, m, k, std::nullopt,
+                    b.second, a.second, n, m, k, swap_recipe,
                     std::make_tuple(gb, gk), std::make_tuple(ga, gk),
                     std::nullopt, std::nullopt, false);
             sm120_fp8_fp4_gemm_1d1d(b.first, sfa_sw, a.first, sfb_sw, std::nullopt, d,
