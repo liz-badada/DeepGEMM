@@ -88,8 +88,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr bool kUseG2Tuned = kGemmType == GemmType::MGroupedMasked and
         kIsFP4 and not kBIsFP4 and kBKMajor and kNumSMs == 48;
 
-    // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // Cooperative warp layout: warps split across M and N dimensions.
+    // Pure-FP4 grouped (W4A4): four-N-warp split + transposed warp map halves
+    // the live B-fragment registers per warp, relieving the LDSM/OMMA
+    // register-reuse `wait` stalls seen in NCU sampling on GB10.
+    static constexpr bool kUseFP4GroupedNW4 = kIsGroupedM and kIsFP4 and not kBIsFP4
+        and kBKMajor and kNumSMs == 48;
+    static constexpr uint32_t kNWarps = kUseFP4GroupedNW4 ? 4 : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -345,8 +350,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = math_warp_idx / kNWarps;
-        const uint32_t warp_n = math_warp_idx % kNWarps;
+        const uint32_t warp_m = kUseFP4GroupedNW4 ? (math_warp_idx % kMWarps) : (math_warp_idx / kNWarps);
+        const uint32_t warp_n = kUseFP4GroupedNW4 ? (math_warp_idx / kMWarps) : (math_warp_idx % kNWarps);
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
