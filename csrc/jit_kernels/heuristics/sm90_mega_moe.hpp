@@ -14,7 +14,6 @@
 
 #include "../../utils/math.hpp"
 #include "../../utils/system.hpp"
-#include "mega_moe.hpp"
 #include "sm90.hpp"
 
 namespace deep_gemm {
@@ -165,6 +164,45 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
            load.less_equal(max_load);
 }
 
+static int get_generic_num_experts_per_wave_for_mega_moe_sm90(
+    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
+    const int& intermediate_hidden, const int& block_m, const int& block_n,
+    const int& num_sms) {
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    if (expected_tokens_per_expert < 1)
+        return num_experts_per_rank;
+
+    constexpr int kImbalanceFactor = 2;
+    const int num_m_blocks = ceil_div(
+        static_cast<int>(std::ceil(expected_tokens_per_expert)), block_m);
+    const int num_n_blocks = (2 * intermediate_hidden) / block_n;
+    const int num_l1_blocks_per_expert = num_m_blocks * num_n_blocks;
+    const int min_num_experts_per_wave = num_l1_blocks_per_expert > 0
+        ? ceil_div(kImbalanceFactor * num_sms, num_l1_blocks_per_expert) : 1;
+    if (min_num_experts_per_wave >= num_experts_per_rank)
+        return num_experts_per_rank;
+    if (num_l1_blocks_per_expert >= num_sms)
+        return min_num_experts_per_wave;
+
+    const int max_num_experts_per_wave = std::min(
+        num_experts_per_rank, min_num_experts_per_wave * 2);
+    int best_num_experts_per_wave = min_num_experts_per_wave;
+    float best_tail_ratio = -1.0f;
+    for (int num_experts_per_wave = min_num_experts_per_wave;
+         num_experts_per_wave <= max_num_experts_per_wave;
+         ++num_experts_per_wave) {
+        const int remainder = num_experts_per_rank % num_experts_per_wave;
+        const float tail_ratio = remainder == 0
+            ? 1.0f : static_cast<float>(remainder) / num_experts_per_wave;
+        if (tail_ratio > best_tail_ratio) {
+            best_tail_ratio = tail_ratio;
+            best_num_experts_per_wave = num_experts_per_wave;
+        }
+    }
+    return best_num_experts_per_wave;
+}
+
 static int get_num_experts_per_wave_for_mega_moe_sm90(
     const Sm90MoeLoad& load,
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
@@ -172,7 +210,7 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     if (block_m == 64 and (load.less_than(1) or load.greater_than(4))) {
         return num_experts_per_rank;
     }
-    return get_num_experts_per_wave_for_mega_moe(
+    return get_generic_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 }
@@ -427,7 +465,7 @@ static MegaMoESM90Config make_generic_mega_moe_config_sm90(
     constexpr bool one_warp_cleanup = false;
 
     const int requested_num_experts_per_wave = conservative ?
-        get_num_experts_per_wave_for_mega_moe(
+        get_generic_num_experts_per_wave_for_mega_moe_sm90(
             input.num_experts_per_rank, input.num_tokens, input.num_topk,
             input.intermediate_hidden, block_m, block_n, input.launch_num_sms) :
         get_num_experts_per_wave_for_mega_moe_sm90(
