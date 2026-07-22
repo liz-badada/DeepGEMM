@@ -100,7 +100,10 @@ select_sm90_nvfp4_h200_fused(
         bool single_active_dispatch_warp;
     } tuning {};
 
-    if (input.num_tokens <= 8)
+    if (input.num_tokens <= 1)
+        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+                  true, true, true};
+    else if (input.num_tokens <= 8)
         tuning = {8, 256, 16, 4, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 16)
