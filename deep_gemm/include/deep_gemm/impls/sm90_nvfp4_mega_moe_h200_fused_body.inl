@@ -78,6 +78,13 @@
     // =====================================================================
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::float_e4m3_t;
+    using task_info_t = sched::TaskInfo;
+    using interleaved_scheduler_t = sched::InterleavedMegaMoEScheduler<
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        L1_SHAPE_N, L1_SHAPE_K,
+        L2_SHAPE_N, L2_SHAPE_K,
+        kNumExpertsPerRank, kNumSMs, kNumRanks>;
+    constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / BLOCK_N;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -216,6 +223,27 @@
     auto full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + i; });
     auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages + i; });
     auto combine_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + i; });
+    constexpr uint32_t kNumBaseBarriers =
+        kNumDispatchWarps + kNumStages * 2 + kNumEpilogueWarps * 2;
+    auto task_info_full_barriers = barrier_start_ptr + kNumBaseBarriers;
+    auto task_info_empty_barriers = task_info_full_barriers +
+        interleaved_scheduler_t::kNumScheduleStages;
+    auto task_infos = reinterpret_cast<task_info_t*>(
+        task_info_empty_barriers +
+        interleaved_scheduler_t::kNumScheduleStages);
+    constexpr uint32_t kInterleavedSchedulerSMEMBytes =
+        2 * interleaved_scheduler_t::kNumScheduleStages * sizeof(Barrier) +
+        interleaved_scheduler_t::kNumScheduleStages * sizeof(task_info_t);
+    DG_STATIC_ASSERT(
+        kInterleavedSchedulerSMEMBytes ==
+            layout::kSM90InterleavedSchedulerSMEMBytes,
+        "Host and device scheduler shared-memory layouts disagree");
+    constexpr uint32_t kInterleavedSMEMEnd =
+        SMEM_BEFORE_BARRIER_SIZE + kNumStages * SMEM_SFA_SIZE_PER_STAGE +
+        kNumBaseBarriers * sizeof(Barrier) +
+        kInterleavedSchedulerSMEMBytes;
+    DG_STATIC_ASSERT(!kUseInterleavedScheduler || kInterleavedSMEMEnd <= 232448,
+                     "Interleaved scheduler exceeds the SM90 shared-memory capacity");
 
     // =====================================================================
     // Initialization
@@ -250,6 +278,15 @@
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 combine_barriers[i]->init(1);
+            if constexpr (kUseInterleavedScheduler) {
+                #pragma unroll
+                for (uint32_t i = 0;
+                     i < interleaved_scheduler_t::kNumScheduleStages;
+                     ++ i) {
+                    task_info_full_barriers[i].init(1);
+                    task_info_empty_barriers[i].init(kNumEpilogueWarps);
+                }
+            }
         }
         cutlass::arch::fence_barrier_init();
     }
@@ -264,6 +301,11 @@
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
         kNumSMs, kNumRanks, 1>(workspace);
+    auto interleaved_scheduler = interleaved_scheduler_t(
+        workspace,
+        task_info_full_barriers,
+        task_info_empty_barriers,
+        task_infos);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -286,7 +328,8 @@
 
     // Register reconfiguration counts (chosen to fit in 64512 reg budget).
     constexpr uint32_t kNumDispatchRegisters    = 48;
-    constexpr uint32_t kNumNonEpilogueRegisters = 40;
+    constexpr uint32_t kNumNonEpilogueRegisters =
+        kUseInterleavedScheduler ? 64 : 40;
     constexpr uint32_t kNumEpilogueRegisters    = 208;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
@@ -296,7 +339,7 @@
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
-    const auto for_each_selected_block = [&](auto&& func) {
+    const auto for_each_static_selected_block = [&](auto&& func) {
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         while (true) {
@@ -306,11 +349,48 @@
                 break;
             if (block_phase == sched::BlockPhase::Linear1) {
                 func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
-                     local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx);
+                     local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
+                     scheduler.get_current_pool_block_offset() + m_block_idx,
+                     scheduler.template get_valid_m<false>());
             } else {
                 func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
-                     local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx);
+                     local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
+                     scheduler.get_current_pool_block_offset() + m_block_idx,
+                     scheduler.template get_valid_m<false>());
             }
+        }
+    };
+
+    const auto invoke_interleaved_task = [&](const task_info_t& task_info,
+                                              auto&& func) {
+        if (task_info.block_phase == sched::BlockPhase::Linear1) {
+            func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
+                 task_info.local_expert_idx, L1_SHAPE_K / BLOCK_K,
+                 task_info.m_block_idx, task_info.n_block_idx,
+                 task_info.pool_block_idx, task_info.valid_m);
+        } else {
+            func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
+                 task_info.local_expert_idx, L2_SHAPE_K / BLOCK_K,
+                 task_info.m_block_idx, task_info.n_block_idx,
+                 task_info.pool_block_idx, task_info.valid_m);
+        }
+    };
+
+    const auto for_each_published_block = [&](auto&& func) {
+        task_info_t task_info;
+        while (interleaved_scheduler.get_published_task(task_info))
+            invoke_interleaved_task(task_info, func);
+    };
+
+    const auto produce_interleaved_blocks = [&](auto&& func) {
+        interleaved_scheduler.fetch_expert_recv_count();
+        while (true) {
+            interleaved_scheduler.wait_task_slot_empty();
+            const auto task_info = interleaved_scheduler.claim_next_task();
+            interleaved_scheduler.publish_task(task_info);
+            if (!task_info.is_valid())
+                break;
+            invoke_interleaved_task(task_info, func);
         }
     };
 
@@ -320,6 +400,12 @@
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+            if constexpr (kUseInterleavedScheduler) {
+                if (thread_idx == 0) {
+                    *workspace.get_l1_task_count_ptr() = 0;
+                    *workspace.get_l2_task_count_ptr() = 0;
+                }
+            }
         } else {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 const auto num_recv_tokens = static_cast<uint32_t>(
@@ -541,16 +627,16 @@
                     input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                     current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
-                const uint32_t sf_pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                const uint32_t pool_token_idx =
+                    expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
                 #pragma unroll
                 for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     if (j < kNumSFFloats)
-                        local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
+                        local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = remote_sf_ptr[j];
                 }
                 __syncwarp();
 
-                const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
                 if (cute::elect_one_sync()) {
                     const auto weight = *sym_buffer.map(
                         input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
@@ -570,7 +656,9 @@
                     cute::tma_store_arrive();
                     ptx::tma_store_wait<0>();
                     ptx::red_add_rel(
-                        workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
+                        workspace.get_l1_arrival_count_ptr(
+                            expert_pool_block_offset + token_idx_in_expert / BLOCK_M),
+                        1u);
                 }
                 __syncwarp();
             }
@@ -593,10 +681,12 @@
         // =====================================================================
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        for_each_selected_block([&](const auto& block_phase,
+        const auto load_a_task = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx,
+                                     const uint32_t& pool_block_idx,
+                                     const uint32_t& valid_m) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
             const auto tensor_map_a_ptr = kBlockIsL2 ?
@@ -604,23 +694,18 @@
             const auto tensor_map_sfa_ptr = kBlockIsL2 ?
                 &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
 
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const bool has_valid_m = valid_m > 0;
 
             // Wait for the pool to be ready.
             if (has_valid_m) {
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                    const auto expected = valid_m;
-                    while (ptx::ld_acq(ptr) != expected);
+                    while (ptx::ld_acq(ptr) != valid_m) {}
                 } else {
-                    // Each L1 N block publishes one ready bit.
-                    constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
                     const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    const uint64_t expected = (kNumL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected);
+                    const uint64_t expected = (kNumRoutedL1BlockNs >= 64)
+                        ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
+                    while (ptx::ld_acq_gpu(ptr) != expected) {}
                 }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -661,15 +746,21 @@
                 }
                 __syncwarp();
             }
-        });
+        };
+        if constexpr (kUseInterleavedScheduler)
+            for_each_published_block(load_a_task);
+        else
+            for_each_static_selected_block(load_a_task);
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        for_each_selected_block([&](const auto& block_phase,
+        const auto load_b_task = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx,
+                                     const uint32_t& pool_block_idx,
+                                     const uint32_t& valid_m) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
             const auto tensor_map_b_ptr = kBlockIsL2 ?
@@ -693,7 +784,11 @@
                 }
                 __syncwarp();
             }
-        });
+        };
+        if constexpr (kUseInterleavedScheduler)
+            produce_interleaved_blocks(load_b_task);
+        else
+            for_each_static_selected_block(load_b_task);
 
     } else {
         // =====================================================================
@@ -734,12 +829,12 @@
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        for_each_selected_block([&](const auto& block_phase,
+        const auto run_math_task = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const uint32_t valid_m = scheduler.template get_valid_m<false>();
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
+                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx,
+                                     const uint32_t& pool_block_idx,
+                                     const uint32_t& valid_m) {
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             const uint32_t wg_n_idx =
                 kSplitMDecodedWeightReuse ? 0u : epilogue_wg_idx * WG_BLOCK_N;
@@ -802,6 +897,10 @@
                  k_block_idx < num_k_blocks;
                  advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
+                if constexpr (kUseInterleavedScheduler) {
+                    if (k_block_idx == 0)
+                        interleaved_scheduler.release_task_info(lane_idx);
+                }
                 decode_b_stage(stage_idx);
 
                 // Read SF (must precede warpgroup_arrive)
@@ -1175,7 +1274,7 @@
                         math::get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
 
                         auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                        const uint32_t token_idx = pool_block_idx * BLOCK_M + token;
+                        const uint32_t token_idx = m_idx + token;
                         sf_base_ptr[sf_base_k_idx * kNumPaddedSFPoolTokens + token_idx] =
                             sf_pair.x;
                         smem_cd_l1_shared_sf[token * kNumEpilogueWarps + reduce_warp_start] = sf_inv_pair.x;
@@ -1377,8 +1476,8 @@
                     // Write one physical L2-activation scale per 128 output columns.
                     if (col_idx == 0) {
                         auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                        const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
-                        const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
+                        const uint32_t token_r0 = m_idx + row_offset_r0;
+                        const uint32_t token_r1 = m_idx + row_offset_r1;
                         const uint32_t base_k_sf_idx =
                             (n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_idx) / kL2ActsSFGranK;
                         #pragma unroll
@@ -1467,7 +1566,8 @@
                         const uint32_t token = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
                         if (token >= valid_m) break;
 
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + token);
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                            pool_block_idx * BLOCK_M + token);
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;
                         const uint32_t dst_token_idx = src_metadata.token_idx;
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
@@ -1500,7 +1600,8 @@
 
                     auto scatter_direct_row = [&](const uint32_t& row_offset, const bool& valid_row, const uint32_t& row_accum_offset) {
                         if (valid_row) {
-                            const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row_offset);
+                            const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                                pool_block_idx * BLOCK_M + row_offset);
                             const uint32_t dst_rank_idx = src_metadata.rank_idx;
                             const uint32_t dst_token_idx = src_metadata.token_idx;
                             const uint32_t dst_topk_idx = src_metadata.topk_idx;
@@ -1532,7 +1633,11 @@
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }
             }
-        });
+        };
+        if constexpr (kUseInterleavedScheduler)
+            for_each_published_block(run_math_task);
+        else
+            for_each_static_selected_block(run_math_task);
 
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM

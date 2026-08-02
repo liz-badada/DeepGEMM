@@ -25,6 +25,7 @@ public:
         bool swap_ab;
         bool use_mode2_row_decoder;
         bool single_active_dispatch_warp;
+        bool use_interleaved_scheduler;
         SM90NVFP4H200FusedConfig config;
 
         void* y;
@@ -51,10 +52,12 @@ public:
         const std::string policy_template_args = fmt::format(
             "/* kSwapABRequested */ {},\n"
             "        /* kSingleActiveDispatchWarp */ {},\n"
-            "        /* kUseMode2RowDecoder */ {}",
+            "        /* kUseMode2RowDecoder */ {},\n"
+            "        /* kUseInterleavedScheduler */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
-            args.use_mode2_row_decoder ? "true" : "false");
+            args.use_mode2_row_decoder ? "true" : "false",
+            args.use_interleaved_scheduler ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -193,6 +196,7 @@ static void sm90_nvfp4_h200_fused_mega_moe(
         .swap_ab = plan.swap_ab,
         .use_mode2_row_decoder = plan.use_mode2_row_decoder,
         .single_active_dispatch_warp = plan.single_active_dispatch_warp,
+        .use_interleaved_scheduler = plan.use_interleaved_scheduler,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -215,9 +219,11 @@ static void sm90_nvfp4_h200_fused_mega_moe(
 
     const auto code = SM90NVFP4H200FusedRuntime::generate(args);
     const auto runtime = compiler->build(
-        plan.use_mode2_row_decoder ?
-            "sm90_nvfp4_h200_fused_mode2_row" :
-            "sm90_nvfp4_h200_fused_lut_window",
+        plan.use_interleaved_scheduler ?
+            "sm90_nvfp4_h200_fused_interleaved" :
+            (plan.use_mode2_row_decoder ?
+                "sm90_nvfp4_h200_fused_mode2_row" :
+                "sm90_nvfp4_h200_fused_lut_window"),
         code);
     SM90NVFP4H200FusedRuntime::launch(runtime, args);
 }

@@ -294,7 +294,8 @@ template <
     bool kFastMath,
     bool kSwapABRequested,
     bool kSingleActiveDispatchWarp,
-    bool kUseMode2RowDecoder
+    bool kUseMode2RowDecoder,
+    bool kUseInterleavedScheduler
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

@@ -73,6 +73,7 @@ struct SM90NVFP4H200FusedPlan {
     bool swap_ab;
     bool use_mode2_row_decoder;
     bool single_active_dispatch_warp;
+    bool use_interleaved_scheduler;
 };
 
 static SM90NVFP4H200FusedPlan
@@ -135,11 +136,14 @@ select_sm90_nvfp4_h200_fused(
             input.num_padded_sf_pool_tokens,
             tuning.num_experts_per_wave,
             tuning.num_stages,
-            tuning.smem_size,
+            cute::min(tuning.smem_size +
+                          layout::kSM90InterleavedSchedulerSMEMBytes,
+                      SM90ArchSpec::smem_capacity),
         },
         tuning.swap_ab,
         tuning.use_mode2_row_decoder,
         tuning.single_active_dispatch_warp,
+        true,
     };
 }
 
