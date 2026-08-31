@@ -12,6 +12,7 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
+static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -48,8 +49,10 @@ struct Workspace {
     uint32_t num_max_pool_tokens;
     uint32_t num_max_pool_blocks;
 
-    // For both grid barrier and NVLink barrier
-    static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    // Keep grid/NVLink/schedule counters isolated from expert counters.  The
+    // interleaved SM90 scheduler places its two hot task counters in separate
+    // 32-byte L2 sectors; expert counters start at the next 128-byte cache line.
+    static constexpr uint64_t kNumBarrierSignalBytes = 128;
 
     CUTLASS_HOST_DEVICE
     Workspace(void* base,
@@ -70,7 +73,7 @@ struct Workspace {
     uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
 
-        // Barrier
+        // Barrier and in-kernel scheduling counters
         num_bytes += kNumBarrierSignalBytes;
 
         // Expert send/recv count
@@ -105,6 +108,9 @@ struct Workspace {
     // [ 0..15]: 4 x `uint32_t` grid sync counters
     // [16..20]: `uint32_t` NVLink barrier counter
     // [20..27]: 2 x `int` NVLink barrier signals (phase 0 and 1)
+    // [28..31]: `uint32_t` L1 schedule task counter
+    // [32..35]: `uint32_t` L2 schedule task counter
+    // [36..127]: padding to isolate hot schedule and expert counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -123,6 +129,16 @@ struct Workspace {
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
         // NOTES: the signal is signed, as we may minus
         return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l1_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 28u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 32u);
     }
 
     CUTLASS_DEVICE
